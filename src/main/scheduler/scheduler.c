@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "platform.h"
 
@@ -32,110 +33,48 @@
 #include "drivers/system.h"
 #include "config/config_unittest.h"
 
+// The current task that is executing. Used to determin what the
+// SELF_TASK is.
 static cfTask_t *currentTask = NULL;
 
+// The realtime guard ensures we are idle when the next realtime task should 
+// run. At runtime the system finds the longest running non-realtime task and 
+// sets it's average run time as the guard time clamped by the min and max values.
 #define REALTIME_GUARD_INTERVAL_MIN     10
 #define REALTIME_GUARD_INTERVAL_MAX     300
 #define REALTIME_GUARD_INTERVAL_MARGIN  25
-
-static uint32_t totalWaitingTasks;
-static uint32_t totalWaitingTasksSamples;
 static uint32_t realtimeGuardInterval = REALTIME_GUARD_INTERVAL_MAX;
 
+// Holds the current time - this is messy but its used by other files.
 uint32_t currentTime = 0;
+
+// Vars to keep track of the work load.
+static uint32_t currentSchedulerExecutionPasses;
+static uint32_t currentSchedulerExecutionPassesWithWork;
 uint16_t averageSystemLoadPercent = 0;
 
-
-static int taskQueuePos = 0;
-static unsigned int taskQueueSize = 0;
-
-STATIC_UNIT_TESTED void queueClear(void)
-{
-    memset(taskQueueArray, 0, taskQueueArraySize * sizeof(cfTask_t *));
-    taskQueuePos = 0;
-    taskQueueSize = 0;
-}
-
-#ifdef UNIT_TEST
-STATIC_UNIT_TESTED int queueSize(void)
-{
-    return taskQueueSize;
-}
-#endif
-
-STATIC_UNIT_TESTED bool queueContains(cfTask_t *task)
-{
-    for (unsigned int ii = 0; ii < taskQueueSize; ++ii) {
-        if (taskQueueArray[ii] == task) {
-            return true;
-        }
-    }
-    return false;
-}
-
-STATIC_UNIT_TESTED bool queueAdd(cfTask_t *task)
-{
-    if ((taskQueueSize >= taskCount) || queueContains(task)) {
-        return false;
-    }
-    for (unsigned int ii = 0; ii <= taskQueueSize; ++ii) {
-        if (taskQueueArray[ii] == NULL || taskQueueArray[ii]->staticPriority < task->staticPriority) {
-            memmove(&taskQueueArray[ii+1], &taskQueueArray[ii], sizeof(task) * (taskQueueSize - ii));
-            taskQueueArray[ii] = task;
-            ++taskQueueSize;
-            return true;
-        }
-    }
-    return false;
-}
-
-STATIC_UNIT_TESTED bool queueRemove(cfTask_t *task)
-{
-    for (unsigned int ii = 0; ii < taskQueueSize; ++ii) {
-        if (taskQueueArray[ii] == task) {
-            memmove(&taskQueueArray[ii], &taskQueueArray[ii+1], sizeof(task) * (taskQueueSize - ii));
-            --taskQueueSize;
-            return true;
-        }
-    }
-    return false;
-}
-
-/*
- * Returns first item queue or NULL if queue empty
- */
-STATIC_INLINE_UNIT_TESTED cfTask_t *queueFirst(void)
-{
-    taskQueuePos = 0;
-    return taskQueueArray[0]; // guaranteed to be NULL if queue is empty
-}
-
-/*
- * Returns next item in queue or NULL if at end of queue
- */
-STATIC_INLINE_UNIT_TESTED cfTask_t *queueNext(void)
-{
-    return taskQueueArray[++taskQueuePos]; // guaranteed to be NULL at end of queue
-}
-
+// The system task exectuion funtion. This does some calculation work.
 void taskSystem(void)
 {
-    /* Calculate system load */
-    if (totalWaitingTasksSamples > 0) {
-        averageSystemLoadPercent = 100 * totalWaitingTasks / totalWaitingTasksSamples;
-        totalWaitingTasksSamples = 0;
-        totalWaitingTasks = 0;
+    // Calc the current cpu work load.
+    if (currentSchedulerExecutionPasses > 0) {
+        averageSystemLoadPercent = 100 * currentSchedulerExecutionPassesWithWork / currentSchedulerExecutionPasses;
+        currentSchedulerExecutionPasses = 0;
+        currentSchedulerExecutionPassesWithWork = 0;
     }
 
-    /* Calculate guard interval */
+    // Calculate guard interval, find the longest running task and set the guard to it's time.
     uint32_t maxNonRealtimeTaskTime = 0;
-    for (const cfTask_t *task = queueFirst(); task != NULL; task = queueNext()) {
-        if (task->staticPriority != TASK_PRIORITY_REALTIME) {
+    for (uint16_t ii = 0; ii < taskCount; ii++) {
+        cfTask_t *task = &cfTasks[ii];
+        // Todo, ideal priorites can really throw this out of wack. We might want to account for them.
+        if (task->priority != TASK_PRIORITY_REALTIME) {
             maxNonRealtimeTaskTime = MAX(maxNonRealtimeTaskTime, task->averageExecutionTime);
         }
     }
-
+    // Clamp by the min, max, and always add the margin.
     realtimeGuardInterval = constrain(maxNonRealtimeTaskTime, REALTIME_GUARD_INTERVAL_MIN, REALTIME_GUARD_INTERVAL_MAX) + REALTIME_GUARD_INTERVAL_MARGIN;
+
 #if defined SCHEDULER_DEBUG
     debug[2] = realtimeGuardInterval;
 #endif
@@ -145,9 +84,9 @@ void taskSystem(void)
 void getTaskInfo(const int taskId, cfTaskInfo_t * taskInfo)
 {
     taskInfo->taskName = cfTasks[taskId].taskName;
-    taskInfo->isEnabled = queueContains(&cfTasks[taskId]);
+    taskInfo->isEnabled = cfTasks[taskId].isEnabled;
     taskInfo->desiredPeriod = cfTasks[taskId].desiredPeriod;
-    taskInfo->staticPriority = cfTasks[taskId].staticPriority;
+    taskInfo->priority = cfTasks[taskId].priority;
     taskInfo->maxExecutionTime = cfTasks[taskId].maxExecutionTime;
     taskInfo->totalExecutionTime = cfTasks[taskId].totalExecutionTime;
     taskInfo->averageExecutionTime = cfTasks[taskId].averageExecutionTime;
@@ -155,9 +94,9 @@ void getTaskInfo(const int taskId, cfTaskInfo_t * taskInfo)
 }
 #endif
 
-void rescheduleTask(const int taskId, uint32_t newPeriodMicros)
+void updateTaskExecutionPeriod(const int taskId, uint32_t newPeriodMicros)
 {
-    if (taskId == TASK_SELF || taskId < (int)taskCount) {
+    if ((taskId == TASK_SELF && currentTask != NULL) || (taskId < (int)taskCount && taskId >= 0)) {
         cfTask_t *task = taskId == TASK_SELF ? currentTask : &cfTasks[taskId];
         task->desiredPeriod = MAX(100, newPeriodMicros);  // Limit delay to 100us (10 kHz) to prevent scheduler clogging
     }
@@ -165,19 +104,15 @@ void rescheduleTask(const int taskId, uint32_t newPeriodMicros)
 
 void setTaskEnabled(const int taskId, bool enabled)
 {
-    if (taskId == TASK_SELF || taskId < (int)taskCount) {
+    if ((taskId == TASK_SELF && currentTask != NULL) || (taskId < (int)taskCount && taskId >= 0)) {
         cfTask_t *task = taskId == TASK_SELF ? currentTask : &cfTasks[taskId];
-        if (enabled && task->taskFunc) {
-            queueAdd(task);
-        } else {
-            queueRemove(task);
-        }
+        task->isEnabled = (enabled && task->taskFunc);
     }
 }
 
 uint32_t getTaskDeltaTime(const int taskId)
 {
-    if (taskId == TASK_SELF || taskId < (int)taskCount) {
+    if ((taskId == TASK_SELF && currentTask != NULL) || (taskId < (int)taskCount && taskId >= 0)) {
         cfTask_t *task = taskId == TASK_SELF ? currentTask : &cfTasks[taskId];
         return task->taskLatestDeltaTime;
     } else {
@@ -187,86 +122,131 @@ uint32_t getTaskDeltaTime(const int taskId)
 
 void schedulerInit(void)
 {
-    queueClear();
+    // Disable all tasks and set defaults
+    for(uint16_t ii = 0; ii < taskCount; ii++)
+    {
+        cfTasks[ii].isEnabled = false;
+        cfTasks[ii].isWaitingToBeRan = false;
+        cfTasks[ii].lastIdealExecutionTime = 0;
+    }
 }
 
-void scheduler(void)
+void schedulerExecute(void)
 {
     // Cache currentTime
     currentTime = micros();
 
-    // Check for realtime tasks
+    // Check for realtime tasks and when they need to run next.
     uint32_t timeToNextRealtimeTask = UINT32_MAX;
-    for (const cfTask_t *task = queueFirst(); task != NULL && task->staticPriority >= TASK_PRIORITY_REALTIME; task = queueNext()) {
-        const uint32_t nextExecuteAt = task->lastExecutedAt + task->desiredPeriod;
-        if ((int32_t)(currentTime - nextExecuteAt) >= 0) {
-            timeToNextRealtimeTask = 0;
-        } else {
-            const uint32_t newTimeInterval = nextExecuteAt - currentTime;
-            timeToNextRealtimeTask = MIN(timeToNextRealtimeTask, newTimeInterval);
+    for (uint16_t ii = 0; ii < taskCount; ii++) {
+        cfTask_t *task = &cfTasks[ii];
+        if(task->isEnabled && task->priority >= TASK_PRIORITY_REALTIME) {
+            const uint32_t nextExecuteAt = task->lastExecutedAt + task->desiredPeriod;
+            if ((int32_t)(currentTime - nextExecuteAt) >= 0) {
+                timeToNextRealtimeTask = 0;
+            } else {
+                const uint32_t newTimeInterval = nextExecuteAt - currentTime;
+                timeToNextRealtimeTask = MIN(timeToNextRealtimeTask, newTimeInterval);
+            }
         }
     }
+
+    // Determin if we are in the realtime guard time or not. If so we won't schedule
+    // and tasks that aren't realtime.
     const bool outsideRealtimeGuardInterval = (timeToNextRealtimeTask > realtimeGuardInterval);
 
     // The task to be invoked
     cfTask_t *selectedTask = NULL;
-    uint16_t selectedTaskDynamicPriority = 0;
+    uint16_t selectedTaskStarvationPriority = 0;
 
-    // Update task dynamic priorities
-    uint16_t waitingTasks = 0;
-    for (cfTask_t *task = queueFirst(); task != NULL; task = queueNext()) {
-        // Task has checkFunc - event driven
-        if (task->checkFunc != NULL) {
-            // Increase priority for event driven tasks
-            if (task->dynamicPriority > 0) {
-                task->taskAgeCycles = 1 + ((currentTime - task->lastSignaledAt) / task->desiredPeriod);
-                task->dynamicPriority = 1 + task->staticPriority * task->taskAgeCycles;
-                waitingTasks++;
-            } else if (task->checkFunc(currentTime - task->lastExecutedAt)) {
-                task->lastSignaledAt = currentTime;
-                task->taskAgeCycles = 1;
-                task->dynamicPriority = 1 + task->staticPriority;
-                waitingTasks++;
-            } else {
-                task->taskAgeCycles = 0;
+    // Loop through all of the tasks. Check if any of them need to execute now and update 
+    // the dynamicPriority.
+    for (uint16_t ii = 0; ii < taskCount; ii++) {
+        cfTask_t *task = &cfTasks[ii];
+
+        // If the task isn't enabled skip all of this. 
+        if(!task->isEnabled) {
+            continue;
+        }
+
+        // Check if we aren't waiting to be ran but we should be.
+        if(!task->isWaitingToBeRan) {
+            // Check if this is an event driven task.
+            if (task->checkFunc != NULL) {
+                // Ask if we should run this task.
+                if(task->checkFunc(currentTime - task->lastExecutedAt))
+                {
+                    // We should run this task, set the ideal execution time to now.
+                    task->lastIdealExecutionTime = currentTime;
+                    task->isWaitingToBeRan = true;
+                }
             }
-        } else {
-            // Task is time-driven, dynamicPriority is last execution age (measured in desiredPeriods)
-            // Task age is calculated from last execution
-            task->taskAgeCycles = ((currentTime - task->lastExecutedAt) / task->desiredPeriod);
-            if (task->taskAgeCycles > 0) {
-                task->dynamicPriority = 1 + task->staticPriority * task->taskAgeCycles;
-                waitingTasks++;
+            else
+            {
+                // This isn't event driven, see if it should be ran based on time. 
+                // Note it is important to use the time it should have been schedulled not when it was,
+                // this will give use more accurate interval times.
+                // TODO: handle currentTime rolling over.
+                if((task->lastIdealExecutionTime + task->desiredPeriod) <= currentTime)
+                {
+                    // Ensure that our next scheduled time (after this one) is past the current time
+                    // so we don't starve on really aggressive tasks.
+                    while((task->lastIdealExecutionTime + task->desiredPeriod) <= currentTime)
+                    {
+                        task->lastIdealExecutionTime += task->desiredPeriod;
+                    }
+                    task->isWaitingToBeRan = true;
+                }
             }
         }
 
-        if (task->dynamicPriority > selectedTaskDynamicPriority) {
-            const bool taskCanBeChosenForScheduling =
-                (outsideRealtimeGuardInterval) ||
-                (task->taskAgeCycles > 1) ||
-                (task->staticPriority == TASK_PRIORITY_REALTIME);
-            if (taskCanBeChosenForScheduling) {
-                selectedTaskDynamicPriority = task->dynamicPriority;
-                selectedTask = task;
+        // Now check if the task is waiting to be ran. 
+        if(task->isWaitingToBeRan) {
+
+            // Figure out how many cycles this task has been waiting.
+            uint32_t taskAge = 1 + ((currentTime - task->lastIdealExecutionTime) / task->desiredPeriod);
+
+            // Figure out the starvationPriority. This will get higher the longer the task waits.  
+            // Note that for idle task the pri is 0 so they always fall to 1. They will always be overtaken by
+            // any other task.          
+            uint32_t starvationPriority = 1 + task->priority * taskAge;
+
+            // Now, figure out if we should select this task 
+            if (starvationPriority > selectedTaskStarvationPriority) {
+                const bool taskCanBeChosenForScheduling =
+                    (outsideRealtimeGuardInterval) ||
+                    (task->priority == TASK_PRIORITY_REALTIME);
+                if (taskCanBeChosenForScheduling) {
+                    selectedTaskStarvationPriority = starvationPriority;
+                    selectedTask = task;
+                }
             }
-        }
+        }   
     }
 
-    totalWaitingTasksSamples++;
-    totalWaitingTasks += waitingTasks;
-
+    // Set the current task, note this can be null.
     currentTask = selectedTask;
+    
+    // Update our load values. 
+    currentSchedulerExecutionPasses++;
+    if(currentTask != NULL)
+    {
+        currentSchedulerExecutionPassesWithWork++;
+    }
 
     if (selectedTask != NULL) {
         // Found a task that should be run
         selectedTask->taskLatestDeltaTime = currentTime - selectedTask->lastExecutedAt;
-        selectedTask->lastExecutedAt = currentTime;
-        selectedTask->dynamicPriority = 0;
+        selectedTask->lastExecutedAt = currentTime;        
 
         // Execute task
         const uint32_t currentTimeBeforeTaskCall = micros();
         selectedTask->taskFunc();
         const uint32_t taskExecutionTime = micros() - currentTimeBeforeTaskCall;
+
+        // Clear our current task 
+        currentTask = NULL;
+        selectedTask->isWaitingToBeRan = false;
 
         selectedTask->averageExecutionTime = ((uint32_t)selectedTask->averageExecutionTime * 31 + taskExecutionTime) / 32;
 #ifndef SKIP_TASK_STATISTICS
