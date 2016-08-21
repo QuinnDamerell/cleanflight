@@ -23,14 +23,12 @@
 cfTask_t *unittest_scheduler_selectedTask;
 uint8_t unittest_scheduler_selectedTaskStarvationPriority;
 uint32_t unittest_scheduler_timeToNextRealtimeTask;
-bool unittest_outsideRealtimeGuardInterval;
 
 #define GET_SCHEDULER_LOCALS() \
     { \
     unittest_scheduler_selectedTask = selectedTask; \
     unittest_scheduler_selectedTaskStarvationPriority = selectedTaskStarvationPriority; \
     unittest_scheduler_timeToNextRealtimeTask = timeToNextRealtimeTask; \
-    unittest_outsideRealtimeGuardInterval = outsideRealtimeGuardInterval; \
     }
 
 #else

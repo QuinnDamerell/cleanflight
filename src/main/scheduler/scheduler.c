@@ -33,17 +33,9 @@
 #include "drivers/system.h"
 #include "config/config_unittest.h"
 
-// The current task that is executing. Used to determin what the
+// The current task that is executing. Used to determine what the
 // SELF_TASK is.
 static cfTask_t *currentTask = NULL;
-
-// The realtime guard ensures we are idle when the next realtime task should 
-// run. At runtime the system finds the longest running non-realtime task and 
-// sets it's average run time as the guard time clamped by the min and max values.
-#define REALTIME_GUARD_INTERVAL_MIN     10
-#define REALTIME_GUARD_INTERVAL_MAX     300
-#define REALTIME_GUARD_INTERVAL_MARGIN  25
-static uint32_t realtimeGuardInterval = REALTIME_GUARD_INTERVAL_MAX;
 
 // Holds the current time - this is messy but its used by other files.
 uint32_t currentTime = 0;
@@ -52,31 +44,30 @@ uint32_t currentTime = 0;
 static uint32_t currentSchedulerExecutionPasses;
 static uint32_t currentSchedulerExecutionPassesWithWork;
 uint16_t averageSystemLoadPercent = 0;
+bool isCpuOverloaded = false;
+bool localIsCpuOverloaded = false;
 
-// The system task exectuion funtion. This does some calculation work.
+// The system task execution function. This does some calculation work.
 void taskSystem(void)
 {
     // Calc the current cpu work load.
     if (currentSchedulerExecutionPasses > 0) {
+        debug[1] = currentSchedulerExecutionPassesWithWork;
+        debug[2] = currentSchedulerExecutionPasses;
         averageSystemLoadPercent = 100 * currentSchedulerExecutionPassesWithWork / currentSchedulerExecutionPasses;
         currentSchedulerExecutionPasses = 0;
         currentSchedulerExecutionPassesWithWork = 0;
     }
 
-    // Calculate guard interval, find the longest running task and set the guard to it's time.
-    uint32_t maxNonRealtimeTaskTime = 0;
-    for (uint16_t ii = 0; ii < taskCount; ii++) {
-        cfTask_t *task = &cfTasks[ii];
-        // Todo, ideal priorites can really throw this out of wack. We might want to account for them.
-        if (task->priority != TASK_PRIORITY_REALTIME) {
-            maxNonRealtimeTaskTime = MAX(maxNonRealtimeTaskTime, task->averageExecutionTime);
-        }
-    }
-    // Clamp by the min, max, and always add the margin.
-    realtimeGuardInterval = constrain(maxNonRealtimeTaskTime, REALTIME_GUARD_INTERVAL_MIN, REALTIME_GUARD_INTERVAL_MAX) + REALTIME_GUARD_INTERVAL_MARGIN;
+    // Update the cpu overload value
+    isCpuOverloaded = localIsCpuOverloaded;
 
-#if defined SCHEDULER_DEBUG
-    debug[2] = realtimeGuardInterval;
+#ifdef SCHEDULER_DEBUG_PRINT
+    printf("System Task Ran - avg system load (%d)\n",averageSystemLoadPercent);
+    if(isCpuOverloaded)
+    {
+        printf(" - SYSTEM IS OVERLAODED, WE SKIPPED TASK PERIODS.\n");
+    }
 #endif
 }
 
@@ -128,6 +119,8 @@ void schedulerInit(void)
         cfTasks[ii].isEnabled = false;
         cfTasks[ii].isWaitingToBeRan = false;
         cfTasks[ii].lastIdealExecutionTime = 0;
+        cfTasks[ii].averageExecutionTime = 0;
+        cfTasks[ii].lastExecutedAt = 0;
     }
 }
 
@@ -136,12 +129,13 @@ void schedulerExecute(void)
     // Cache currentTime
     currentTime = micros();
 
-    // Check for realtime tasks and when they need to run next.
+    // Realtime Guard; We want to ensure whatever task we schedule now wont overrun a realtime task time.
+    // Find when the next realtime task will run.
     uint32_t timeToNextRealtimeTask = UINT32_MAX;
     for (uint16_t ii = 0; ii < taskCount; ii++) {
         cfTask_t *task = &cfTasks[ii];
         if(task->isEnabled && task->priority >= TASK_PRIORITY_REALTIME) {
-            const uint32_t nextExecuteAt = task->lastExecutedAt + task->desiredPeriod;
+            const uint32_t nextExecuteAt = task->lastIdealExecutionTime + task->desiredPeriod;
             if ((int32_t)(currentTime - nextExecuteAt) >= 0) {
                 timeToNextRealtimeTask = 0;
             } else {
@@ -151,13 +145,14 @@ void schedulerExecute(void)
         }
     }
 
-    // Determin if we are in the realtime guard time or not. If so we won't schedule
-    // and tasks that aren't realtime.
-    const bool outsideRealtimeGuardInterval = (timeToNextRealtimeTask > realtimeGuardInterval);
+#ifdef SCHEDULER_DEBUG_PRINT
+    printf("Time Until Next Realtime (%u)\n", timeToNextRealtimeTask);
+#endif
 
     // The task to be invoked
     cfTask_t *selectedTask = NULL;
-    uint16_t selectedTaskStarvationPriority = 0;
+    int32_t selectedTaskStarvationPriority = 0;          
+    bool realtimeGuardWorkDeferred = false;
 
     // Loop through all of the tasks. Check if any of them need to execute now and update 
     // the dynamicPriority.
@@ -167,7 +162,7 @@ void schedulerExecute(void)
         // If the task isn't enabled skip all of this. 
         if(!task->isEnabled) {
             continue;
-        }
+        }     
 
         // Check if we aren't waiting to be ran but we should be.
         if(!task->isWaitingToBeRan) {
@@ -184,42 +179,72 @@ void schedulerExecute(void)
             else
             {
                 // This isn't event driven, see if it should be ran based on time. 
-                // Note it is important to use the time it should have been schedulled not when it was,
+                // Note it is important to use the time it should have been scheduled not when it was,
                 // this will give use more accurate interval times.
                 // TODO: handle currentTime rolling over.
                 if((task->lastIdealExecutionTime + task->desiredPeriod) <= currentTime)
                 {
-                    // Ensure that our next scheduled time (after this one) is past the current time
-                    // so we don't starve on really aggressive tasks.
-                    while((task->lastIdealExecutionTime + task->desiredPeriod) <= currentTime)
-                    {
-                        task->lastIdealExecutionTime += task->desiredPeriod;
-                    }
-                    task->isWaitingToBeRan = true;
+                    task->lastIdealExecutionTime += task->desiredPeriod;
+                    task->isWaitingToBeRan = true;                    
                 }
             }
-        }
+        }   
 
         // Now check if the task is waiting to be ran. 
         if(task->isWaitingToBeRan) {
 
             // Figure out how many cycles this task has been waiting.
-            uint32_t taskAge = 1 + ((currentTime - task->lastIdealExecutionTime) / task->desiredPeriod);
+            const uint32_t taskAge = 1 + ((currentTime - task->lastIdealExecutionTime) / task->desiredPeriod);
 
-            // Figure out the starvationPriority. This will get higher the longer the task waits.  
-            // Note that for idle task the pri is 0 so they always fall to 1. They will always be overtaken by
-            // any other task.          
-            uint32_t starvationPriority = 1 + task->priority * taskAge;
+            // Figure out the starvationPriority. This will get higher the longer the task waits. If the value is 0
+            // the task shouldn't be scheduled (this happens by the realtime guard) 
+            // Note: For idle task the pri is 0 so they always fall to 1. They will always be overtaken by
+            // any other task if there is something to run.
+            int32_t starvationPriority = 1 + task->priority * taskAge;
 
-            // Now, figure out if we should select this task 
-            if (starvationPriority > selectedTaskStarvationPriority) {
-                const bool taskCanBeChosenForScheduling =
-                    (outsideRealtimeGuardInterval) ||
-                    (task->priority == TASK_PRIORITY_REALTIME);
-                if (taskCanBeChosenForScheduling) {
-                    selectedTaskStarvationPriority = starvationPriority;
-                    selectedTask = task;
+            // Realtime Guard Check
+            // We now need to guard for realtime tasks. Lets see if this task can run before the next realtime task.
+            if(task->priority < TASK_PRIORITY_REALTIME && 
+               task->averageExecutionTime >= timeToNextRealtimeTask)
+            {
+                // We shouldn't select this task because it will take too long and the realtime task won't be ran on time.
+                // However we don't want to 100 starve the task, so we will heavily weight the task, but if it still wins the
+                // starvationPriority game it will be ran anyways. The weight will be higher for lower priority tasks.
+                // Note: A value of 0 will not allow the task to be scheduled.
+                const uint16_t delayWeightAmplifier = (7 - task->priority);
+                starvationPriority = MAX(0, starvationPriority - (delayWeightAmplifier * 28));
+                
+                if(task->priority == TASK_PRIORITY_IDLE)
+                {
+                    // If this is an idle task don't ever schedule it if it can't run in time.
+                    starvationPriority = 0;
                 }
+                else
+                {
+                    // If we deferred work we should indicate we did so the cpu load will be
+                    // correctly reported. We don't want to set this for idle work.
+                    realtimeGuardWorkDeferred = true;
+                }
+
+#ifdef SCHEDULER_DEBUG_PRINT
+                printf("Realtime Guard task delay (%s), (%d)\n", task->taskName, starvationPriority);     
+#endif           
+            }
+
+#ifdef SCHEDULER_DEBUG_PRINT
+            printf("Waiting Task (%s), age:(%d) starvation :(%d)\n", task->taskName, taskAge, starvationPriority);
+#endif
+
+            // Now, figure out if we should select this task. If the value is 0 never schedule the task.
+            if (starvationPriority != 0 &&
+                starvationPriority > selectedTaskStarvationPriority) {
+
+                selectedTaskStarvationPriority = starvationPriority;
+                selectedTask = task;
+
+#ifdef SCHEDULER_DEBUG_PRINT
+                printf(" - Selected Task (%s), (%d)\n", task->taskName, starvationPriority);  
+#endif
             }
         }   
     }
@@ -227,9 +252,9 @@ void schedulerExecute(void)
     // Set the current task, note this can be null.
     currentTask = selectedTask;
     
-    // Update our load values. 
+    // Update our load value. If we don't have a task but have deferred work count this as a busy cycle.
     currentSchedulerExecutionPasses++;
-    if(currentTask != NULL)
+    if(selectedTask != NULL || realtimeGuardWorkDeferred)
     {
         currentSchedulerExecutionPassesWithWork++;
     }
@@ -237,12 +262,28 @@ void schedulerExecute(void)
     if (selectedTask != NULL) {
         // Found a task that should be run
         selectedTask->taskLatestDeltaTime = currentTime - selectedTask->lastExecutedAt;
-        selectedTask->lastExecutedAt = currentTime;        
+        selectedTask->lastExecutedAt = currentTime;    
+
+#ifdef SCHEDULER_DEBUG_PRINT
+        printf("Running Task (%s)\n",selectedTask->taskName); 
+#endif   
 
         // Execute task
         const uint32_t currentTimeBeforeTaskCall = micros();
         selectedTask->taskFunc();
         const uint32_t taskExecutionTime = micros() - currentTimeBeforeTaskCall;
+
+        // If the task is time based and not event based make sure the next execute time is after the current time.
+        // If it isn't than we are behind on tasks. To try to catch back up we will make sure this task doesn't execute
+        // until at least sometime in the future. This might help us recover.
+        if(selectedTask->checkFunc == NULL)
+        {    
+            while((selectedTask->lastIdealExecutionTime + selectedTask->desiredPeriod) <= currentTime + taskExecutionTime)
+            {
+                selectedTask->lastIdealExecutionTime += selectedTask->desiredPeriod;
+                localIsCpuOverloaded = true;
+            }
+        }
 
         // Clear our current task 
         currentTask = NULL;
